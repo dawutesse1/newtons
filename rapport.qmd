@@ -32,12 +32,14 @@ Pkg.add("Metis")
 Pkg.add("AMD")
 Pkg.add("NLPModels")
 Pkg.add("ADNLPModels")
-Pkg.add("IterativeSolvers")
+Pkg.add("Krylov")
 using LDLFactorizations, Metis, AMD
 using NLPModels, ADNLPModels
 using LinearAlgebra
-using IterativeSolvers  # for CG in inexact Newton
 using Printf
+using NLPModels       # pour user-defined models :contentReference[oaicite:0]{index=0}
+using ADNLPModels     
+using Krylov
 ```
 
 # Contexte
@@ -67,39 +69,48 @@ Votre implémentation doit avoir les caractéristiques suivantes :
 Tester votre implémentation sur le problème polynomial vu en classe et les problèmes non linéaires de la section *Problèmes test* ci-dessous.
 
 ```{julia}
-function newton_modifiee(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # votre code ici
-    x = copy(model.meta.x0)
-    n = length(x)
-    maxiter = 10 * n
-    println(@sprintf("%4s | %12s | %12s | %8s", "k", "obj", "||g||∞", "α"))
+using LinearAlgebra: Symmetric, triu, UnitLowerTriangular, Diagonal
+using LDLFactorizations             # ldl_analyze, ldl_factorize!
+import NLPModels: obj, grad, hess
 
+function newton_modifiee(model; eps_a=1e-5, eps_r=1e-5)
+    x       = copy(model.meta.x0)
+    n = length(x)
+    maxiter = n
+
+    println(@sprintf("%4s | %12s | %12s | %8s", "k", "obj", "||g||", "α"))
     for k in 1:maxiter
-        fval = obj(model, x)
-        g = grad(model, x)
+        fval  = obj(model, x)
+        g     = grad(model, x)
         gnorm = norm(g, Inf)
         println(@sprintf("%4d | %12.4e | %12.4e |   -   ", k, fval, gnorm))
-        if gnorm < max(atol, rtol * norm(x, Inf))
-            println("Convergence atteinte (||g||∞ = $gnorm)")
-            break
+        if gnorm < max(eps_a, eps_r*norm(x,Inf))
+            println("Convergence atteinte (||g|| = $gnorm)"); break
         end
-        # Hessienne et factorisation LDL
-        H = hess(model, x)
-        LDL = ldl(H)  # P^T H P = L D L^T
-        P = LDL.p
-        L = UnitLowerTriangular(LDL.L)
-        D = LDL.D
-        # Modifier les valeurs propres négatives
-        Dmod = map(d->d>0 ? d : atol, diag(D))
-        Hmod = P' * L * Diagonal(Dmod) * L' * P
-        # Solve direction p
-        p = - Hmod \ g
-        # Backtracking Armijo
+
+        # --- préparation de H pour LDLFactorizations ---
+        Hfull = hess(model, x)           # votre Hessienne (dense ou sparse)
+        Htri  = triu(Hfull)              # on garde la partie U
+        Hs    = Symmetric(Htri, :U)      # objet Symmetric “upper”
+
+        # analyse symbolique + réglage pour SPD
+        LDL       = ldl_analyze(Hs)
+        LDL.tol   = Inf
+        LDL.r1    = eps_a
+
+        # factorisation numérique
+        ldl_factorize!(Hs, LDL)
+
+        # direction par solveur LDL
+        p = - (LDL \ g)
+
+        # recherche linéaire Armijo
         α = 1.0; ρ = 0.5; c = 1e-4
-        while obj(model, x + α*p) > fval + c * α * dot(g, p)
+        while obj(model, x + α*p) > fval + c*α*dot(g,p)
             α *= ρ
         end
-        x .+= α * p
+
+        x .+= α*p
         println(@sprintf("%4d | %12.4e | %12.4e | %8.4e", k, fval, gnorm, α))
     end
     return x
@@ -117,35 +128,50 @@ Il faut de plus ajuster votre méthode de manière à encourager la convergence 
 Tester votre implémentation sur le problème polynomial vu en classe et les problèmes non linéaires de la section *Problèmes test* ci-dessous.
 
 ```{julia}
-function newton_inexacte(model, eps_a=1.0e-5, eps_r=1.0e-5)
-  # votre code ici
-    x = copy(model.meta.x0)
-    n = length(x)
-    maxiter = 10 * n
-    println(@sprintf("%4s | %12s | %12s | %8s", "k", "obj", "||g||∞", "α"))S
+using LinearAlgebra                   # pour norm, dot
+using Krylov                          # gradient conjugué pour LinearOperator
+import NLPModels: obj, grad, hess_op  # interface ADNLPModels
 
+function newton_inexacte(model; eps_a=1e-5, eps_r=1e-5)
+    x       = copy(model.meta.x0)
+    n       = length(x)
+    maxiter = n
+
+    println(@sprintf("%4s | %12s | %12s | %8s", "k", "obj", "||g||", "α"))
     for k in 1:maxiter
-        fval = obj(model, x)
-        g = grad(model, x)
+        # 1) évaluation
+        fval  = obj(model, x)
+        g     = grad(model, x)
         gnorm = norm(g, Inf)
         println(@sprintf("%4d | %12.4e | %12.4e |   -   ", k, fval, gnorm))
-        if gnorm < max(atol, rtol * norm(x, Inf))
-            println("Convergence atteinte (||g||∞ = $gnorm)")
+
+        # 2) critère de convergence
+        if gnorm < max(eps_a, eps_r * norm(x, Inf))
+            println("Convergence atteinte (||g|| = $gnorm)")
             break
         end
-        # Utiliser l'opérateur Hessien pour CG
-        Hop = hess_op(model, x)
-        # Tolérance adaptative pour CG
+
+        # 3) direction inexacte via CG de Krylov.jl
+        Hop    = hess_op(model, x)
         tol_cg = min(0.5, sqrt(gnorm)) * gnorm
-        p, _ = cg(Hop, -g; atol=tol_cg, rtol=tol_cg, maxiter=n)
-        # Backtracking Armijo
+        # cg de Krylov : tol, maxiter, linesearch
+        p, history = Krylov.cg(Hop, -g;
+                        atol    = tol_cg,
+                        rtol        = tol_cg,
+                        itmax    = n,
+                        linesearch = true)
+
+        # 4) recherche linéaire Armijo
         α = 1.0; ρ = 0.5; c = 1e-4
         while obj(model, x + α*p) > fval + c * α * dot(g, p)
             α *= ρ
         end
+
+        # 5) mise à jour
         x .+= α * p
         println(@sprintf("%4d | %12.4e | %12.4e | %8.4e", k, fval, gnorm, α))
     end
+
     return x
 end
 ```
@@ -160,44 +186,23 @@ Votre premier problème test sera le problème polynomial vu en classe.
 # f(x) = ...
 # model = ADNLPModel(...)
 # Définition du modèle polynômial f(x)=2x1^3 -3x1^2 -6x1 x2 (x1 - x2 -1)
-import NLPModels: AbstractNLPModel, obj, grad, hess
-struct PolyTestModel
-    meta::NamedTuple{(:x0,),Tuple{Vector{Float64}}}
-end
-# Constructeur pour initialisation en (0,0)
-function PolyTestModel()
-    PolyTestModel((x0=[0.0, 0.0],))
-end
-# Valeur de f
-function obj(m::PolyTestModel, x)
-    x1, x2 = x
-    return 2x1^3 - 3x1^2 - 6x1*x2*(x1 - x2 - 1)
-end
-# Gradient analytique
-function grad(m::PolyTestModel, x)
-    x1, x2 = x
-    df_dx1 = 6x1^2 - 6x1 - 6x2*(x1 - x2 - 1) - 6x1*x2
-    df_dx2 = -6x1*(x1 - x2 - 1) + 6x1*x2
-    return [df_dx1, df_dx2]
-end
-# Hessienne analytique
-function hess(m::PolyTestModel, x)
-    x1, x2 = x
-    # dérivées secondes
-    d2f_dx1dx1 = 12x1 - 6 - 12x2
-    d2f_dx1dx2 = -6*(x1 - x2 - 1) - 6x1 + 6x1
-    d2f_dx2dx1 = d2f_dx1dx2
-    d2f_dx2dx2 = 6x1
-    return [d2f_dx1dx1 d2f_dx1dx2; d2f_dx2dx1 d2f_dx2dx2]
-end
-# Point de départ
-poly_model = PolyTestModel()
-println("
-=== Problème test polynomial personnalisé ===")
-x_mod_poly = newton_modifiee(poly_model)
-println("Solution Newton modifiée : ", x_mod_poly)
-x_in_poly  = newton_inexacte(poly_model)
-println("Solution Newton tronquée : ", x_in_poly)
+using ADNLPModels         # pour ADNLPModel
+
+# 1) Définition de la fonction polynomiale
+f_poly(x) = 2x[1]^3 - 3x[1]^2 - 6x[1]*x[2]*(x[1] - x[2] - 1)
+
+# 2) Point de départ (0,0)
+x0 = [0.0, 0.0]
+
+# 3) Construction du modèle ADNLPModel
+model = ADNLPModel(f_poly, x0)
+
+# 4) Lancement des algos Newton
+x_star_mod   = newton_modifiee(model)
+x_star_inex  = newton_inexacte(model)
+
+println("Solution Newton modifiée : ", x_star_mod)
+println("Solution Newton inexacte : ", x_star_inex)
 ```
 
 Utiliser ensuite les problèmes non linéaires du dépôt `OptimizationProblems.jl` qui sont sans contraintes et ont 100 variables.
@@ -218,12 +223,38 @@ Parmis ces problèmes, choisissez-en 3 et illustrez le comportement de chacune d
 
 ```{julia}
 # votre code ici
+using OptimizationProblems              # charge meta, etc.
+using OptimizationProblems.ADNLPProblems # importe ADNLProblems dans Main
+using ADNLPModels  
+choix = ["brownal", "broyden3d", "tridia"]
+
+for nom in choix
+    # instanciation de l’instance ADNLP
+    pb    = ADNLPProblems.eval(Meta.parse(nom))()
+    model = ADNLPModel(pb)                    # wrapping ADNLPModels
+    println("\n=== Problème : ", nom, " ===")
+    x_star = newton_modifiee(model)
+    println("Solution trouvée : ", x_star)
+end
 ```
 
 ## Validation de la méthode de Newton tronquée
 
 ```{julia}
 # votre code ici
+using OptimizationProblems              # charge meta, etc.
+using OptimizationProblems.ADNLPProblems # importe ADNLProblems dans Main
+using ADNLPModels  
+choix = ["brownal", "broyden3d", "tridia"]
+
+for nom in choix
+    # instanciation de l’instance ADNLP
+    pb    = ADNLPProblems.eval(Meta.parse(nom))()
+    model = ADNLPModel(pb)                    # wrapping ADNLPModels
+    println("\n=== Problème : ", nom, " ===")
+    x_star = newton_inexacte(model)
+    println("Solution trouvée : ", x_star)
+end
 ```
 
 ## Commentaires sur les résultats
