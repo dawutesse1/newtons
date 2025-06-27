@@ -37,7 +37,7 @@ using LDLFactorizations, Metis, AMD
 using NLPModels, ADNLPModels
 using LinearAlgebra
 using Printf
-using NLPModels       # pour user-defined models :contentReference[oaicite:0]{index=0}
+using NLPModels       
 using ADNLPModels     
 using Krylov
 ```
@@ -89,7 +89,7 @@ function newton_modifiee(model; eps_a=1e-5, eps_r=1e-5)
         end
 
         # --- préparation de H pour LDLFactorizations ---
-        Hfull = hess(model, x)           # votre Hessienne (dense ou sparse)
+        Hfull = hess(model, x)           #  Hessienne (dense ou sparse)
         Htri  = triu(Hfull)              # on garde la partie U
         Hs    = Symmetric(Htri, :U)      # objet Symmetric “upper”
 
@@ -258,5 +258,67 @@ end
 ```
 
 ## Commentaires sur les résultats
+1. 
+  Brownal
+Newton modifiée atteint très rapidement la convergence (3 itérations)
 
+À chaque itération, la recherche linéaire accepte un pas complet (α=1).
+
+La norme du gradient chute de 5 ×10³ à 5 ×10⁻⁶ en deux mises à jour.
+
+
+Newton inexacte (CG + linesearch interne) ne fait qu’un seul pas utile :
+
+La première direction CG est déjà de très bonne qualité, le pas interne linesearch renvoie α=1.
+
+En deux itérations, la norme du gradient descend sous la tolérance.
+
+Bilan : Pour Brownal, les deux variantes convergent quasi en un « vrai » pas de Newton (α=1), et la méthode inexacte coûte légèrement plus en produits H·v, mais ne nécessite pas de factorisation LDL.
+
+2. 
+   Broyden3d
+Newton modifiée converge en 6 itérations :
+
+La décroissance est super-linéaire (obj : 55.5 → 1.6×10⁻¹⁷).
+
+À nouveau, chaque pas de Newton complet (α=1) suffit.
+
+Newton inexacte converge en 6 itérations également :
+
+Les tolérances CG (absolue et relative) sont calibrées pour obtenir une direction assez précise.
+
+Ici aussi, α=1 et la norme du gradient passe de 19 à 1.4×10⁻⁸ très rapidement.
+
+Bilan : Les deux approches sont équivalentes sur ce problème peu grand, la version inexacte évite la factorisation LDL à chaque itération.
+
+3. 
+  Tridia
+Newton modifiée atteint la tolérance en 3 itérations :
+
+Le gradient chute de 400 à 10⁻⁵, toujours avec α=1.
+
+Newton inexacte exige plus d’itérations (une cinquantaine de sous-itérations CG à la 1ʳᵉ étape), puis converge en 2 itérations de Newton :
+
+Le résidu CG chute progressivement, puis α=1 et la mise à jour conduit au critère d’arrêt.
+
+Bilan : Sur Tridia (structure tridiagonale simple), la méthode inexacte fait beaucoup plus de travail scale-down pour résoudre la direction approximative. La méthode modifiée, elle, reste ultra-efficace grâce à sa factorisation LDLᴛ.
+
+Conclusions générales
+Pas complet α=1 : Dans tous les cas, Newton (modifiée ou inexacte) accepte systématiquement le pas de taille 1, ce qui confirme la décroissance locale rapide (proximité d’un minimum quadratique).
+
+Newton modifiée vs inexacte :
+
+Modifiée impose une factorisation LDL à chaque itération, mais converge en très peu d’itérations, ce qui est idéal si n est petit ou moyen et si on peut factoriser avec coût minime.
+
+Inexacte évite la factorisation, remplaçant le calcul de la direction par un solveur CG itératif ; c’est plus rentable si n est très grand et que la Hessienne est sparse.
+
+Convergence locale : Les deux méthodes montrent une décroissance super-linéaire du gradient, valider l’efficacité de la stratégie de tolérancement.
+
+Choix pratique :
+
+Pour des problèmes jusqu’à quelques milliers de variables, Newton modifiée reste souvent plus rapide.
+
+Pour des problèmes de très grande dimension ou à hessienne creuse, Newton inexacte (avec CG et linesearch interne) devient incontournable.
+
+Ces expériences illustrent parfaitement la complémentarité des deux variantes de Newton et le rôle crucial du choix de la direction (exacte vs inexacte) selon la taille et la structure du problème.
 <!-- Insérer ici votre évaluation des résultats -->
